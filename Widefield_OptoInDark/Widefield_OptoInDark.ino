@@ -1,9 +1,12 @@
 /*
   Widefield + Strobing Fluorescence + Optogenetic Control (non-blocking, millis-based)
   Implements: absolute-timed frame scheduler.
-  Pattern: GREEN always ON (pulsed). BLUE always OFF.
-  RED Opto: (20s OFF, 10s ON) x 8 cycles.
-  During 10s ON blocks, RED pulses simultaneously with GREEN.
+  Pattern: Three-block experiment (440 seconds total):
+    - Pre-green block (100s): GREEN always ON (pulsed), RED OFF
+    - Middle block (240s): GREEN always ON (pulsed), RED Opto (20s OFF, 10s ON) x 8 cycles
+    - Post-green block (100s): GREEN always ON (pulsed), RED OFF
+  BLUE always OFF.
+  During RED ON blocks, RED pulses simultaneously with GREEN.
   
   Pins (per user spec):
     3  - Camera exposure/frame-start trigger (OUTPUT, DIGITAL; active HIGH)
@@ -62,6 +65,12 @@ long lastProcessedFrameIndex  = -1;    // last frame index we triggered
 // Status interval
 const unsigned long STATUS_INTERVAL_MS = 10000UL;
 
+// Experiment timing constants
+const unsigned long PRE_GREEN_MS = 100000UL;   // 100 seconds pre-green block
+const unsigned long RED_PHASE_MS = 240000UL;   // 240 seconds middle block (8 cycles of 30s)
+const unsigned long POST_GREEN_MS = 100000UL;  // 100 seconds post-green block
+const unsigned long TOTAL_EXP_MS = PRE_GREEN_MS + RED_PHASE_MS + POST_GREEN_MS; // 440 seconds total
+
 // --- Utilities ---
 void setAllLedsLow() {
   digitalWrite(PIN_BLUE,  LOW);
@@ -101,7 +110,7 @@ void printSettings() {
   }
   Serial.println(F(")"));
   Serial.print(F("             exposureHighMs: ")); Serial.print(exposureHighMs); Serial.println(F(" ms"));
-  Serial.println(F("             Pattern       : GREEN always ON. RED: 20s OFF / 10s ON (Red pulses with Green)"));
+  Serial.println(F("             Pattern       : Pre-green (100s) + Middle (240s: RED 20s OFF/10s ON x8) + Post-green (100s) = 440s total"));
 }
 
 void formatHMSms(unsigned long totalMs, char* out, size_t n) {
@@ -155,32 +164,57 @@ void triggerFrame(unsigned long frameStartAbsMs, long frameIndex) {
   greenOn = true;
   greenOffAtMs = frameStartAbsMs + exposureHighMs;
 
-  // 3) RED Logic: (20s OFF, 10s ON) x 8 cycles
+  // 3) RED Logic: Three-block pattern
   unsigned long elapsed = frameStartAbsMs - expStartMs;
   
-  // Check if we have completed 8 cycles (240 seconds)
-  if (elapsed >= 240000UL) {
+  // Check if experiment duration exceeded
+  if (elapsed >= TOTAL_EXP_MS) {
     if (running) stopExperiment(millis());
     return;
   }
 
-  unsigned long cycleTime = elapsed % 30000UL;
-  bool currentRedBlock = (cycleTime >= 20000UL); // within the ON window of a cycle
-
-  if (currentRedBlock != inRedBlock) {
-    inRedBlock = currentRedBlock;
+  // Determine which block we're in
+  if (elapsed < PRE_GREEN_MS) {
+    // Pre-green block: RED OFF
+    digitalWrite(PIN_RED, LOW);
+    redOn = false;
     if (inRedBlock) {
-       unsigned long cycleNum = (elapsed / 30000UL) + 1;
-       Serial.print(F(">> RED ON (Block ")); Serial.print(cycleNum); Serial.println(F(") - Green continues pulsing"));
-    } else {
-       Serial.println(F(">> RED OFF"));
+      inRedBlock = false;
+      Serial.println(F(">> RED OFF"));
     }
-  }
+  } else if (elapsed < PRE_GREEN_MS + RED_PHASE_MS) {
+    // Middle block: RED logic (20s OFF, 10s ON) x 8 cycles
+    // Calculate elapsed time relative to start of middle block
+    unsigned long middleElapsed = elapsed - PRE_GREEN_MS;
+    unsigned long cycleTime = middleElapsed % 30000UL;
+    bool currentRedBlock = (cycleTime >= 20000UL); // within the ON window of a cycle
 
-  if (inRedBlock) {
-    digitalWrite(PIN_RED, HIGH);
-    redOn = true;
-    redOffAtMs = frameStartAbsMs + exposureHighMs;
+    if (currentRedBlock != inRedBlock) {
+      inRedBlock = currentRedBlock;
+      if (inRedBlock) {
+         unsigned long cycleNum = (middleElapsed / 30000UL) + 1;
+         Serial.print(F(">> RED ON (Block ")); Serial.print(cycleNum); Serial.println(F(") - Green continues pulsing"));
+      } else {
+         Serial.println(F(">> RED OFF"));
+      }
+    }
+
+    if (inRedBlock) {
+      digitalWrite(PIN_RED, HIGH);
+      redOn = true;
+      redOffAtMs = frameStartAbsMs + exposureHighMs;
+    } else {
+      digitalWrite(PIN_RED, LOW);
+      redOn = false;
+    }
+  } else {
+    // Post-green block: RED OFF
+    digitalWrite(PIN_RED, LOW);
+    redOn = false;
+    if (inRedBlock) {
+      inRedBlock = false;
+      Serial.println(F(">> RED OFF"));
+    }
   }
 
   framesSent++;
