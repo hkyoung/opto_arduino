@@ -66,7 +66,7 @@ long lastProcessedFrameIndex  = -1;    // last frame index we triggered
 const unsigned long STATUS_INTERVAL_MS = 10000UL;
 
 // Experiment timing constants
-const unsigned long PRE_GREEN_MS = 100000UL;   // 100 seconds pre-green block
+const unsigned long PRE_GREEN_MS = 10000UL;   // 100 seconds pre-green block
 const unsigned long RED_PHASE_MS = 240000UL;   // 240 seconds middle block (8 cycles of 30s)
 const unsigned long POST_GREEN_MS = 100000UL;  // 100 seconds post-green block
 const unsigned long TOTAL_EXP_MS = PRE_GREEN_MS + RED_PHASE_MS + POST_GREEN_MS; // 440 seconds total
@@ -177,6 +177,7 @@ void triggerFrame(unsigned long frameStartAbsMs, long frameIndex) {
   if (elapsed < PRE_GREEN_MS) {
     // Pre-green block: RED OFF
     digitalWrite(PIN_RED, LOW);
+    digitalWrite(PIN_BLUE, LOW); // 251219: second red LED
     redOn = false;
     if (inRedBlock) {
       inRedBlock = false;
@@ -201,15 +202,18 @@ void triggerFrame(unsigned long frameStartAbsMs, long frameIndex) {
 
     if (inRedBlock) {
       digitalWrite(PIN_RED, HIGH);
+      digitalWrite(PIN_BLUE, HIGH); // 251219: second red LED
       redOn = true;
       redOffAtMs = frameStartAbsMs + exposureHighMs;
     } else {
       digitalWrite(PIN_RED, LOW);
+      digitalWrite(PIN_BLUE, LOW); // 251219: second red LED
       redOn = false;
     }
   } else {
     // Post-green block: RED OFF
     digitalWrite(PIN_RED, LOW);
+    digitalWrite(PIN_BLUE, LOW); // 251219: second red LED
     redOn = false;
     if (inRedBlock) {
       inRedBlock = false;
