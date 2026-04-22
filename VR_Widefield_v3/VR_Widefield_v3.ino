@@ -35,8 +35,8 @@ const uint8_t PIN_GREEN  = 12;
 const uint8_t PIN_RED    = 13;
 
 // ---- Config (user changeable at runtime) ----
-unsigned long framePeriodMs   = 100UL; // default 8 Hz
-unsigned long exposureHighMs  = 70UL; // HIGH width for camera + LEDs
+unsigned long framePeriodMs   = 200UL; // default 8 Hz
+unsigned long exposureHighMs  = 170UL; // HIGH width for camera + LEDs
 bool firstFrameBlue           = true;  // per user: first frame should be BLUE
 
 // ---- Run state ----
