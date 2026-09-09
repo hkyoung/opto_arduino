@@ -1,24 +1,34 @@
 // VR_Opto_9 -- combines VR_Opto_8's frame-interleaved opto pulse with
 // VR_Opto_7's PMT shutter output.
 //
-// Opto and shutter run in alternating phases of framesPerAnchor frames each:
-// the shutter closes and the light fires for one phase, then both rest for the
-// next. Everything below is derived from framesPerAnchor, so changing that one
-// constant retimes the whole sketch and keeps the shutter/opto guard bands
-// intact -- see the table at framesPerAnchor.
+// A stim event is triggered by a frame edge and then runs entirely on absolute
+// micros() deadlines, so the whole close/fire/reopen sequence completes INSIDE
+// the stim frame and the blade is stationary before the next imaging frame
+// begins. Shutter reopen is deliberately NOT tied to the following frame edge --
+// that was the old behavior, and it left the blade travelling during the first
+// 5 ms of every imaging frame (visible as a dark band across the top of the
+// raster).
 //
-// Phase timing (framesPerAnchor = 2, 30 Hz imaging, frame = 33.3 ms):
-//   t =  0.0 ms  frame edge -- shutter CLOSES
-//   t =  1.0 ms  opto ON      (optoLagTime after the shutter is already shut)
-//   t = 65.0 ms  opto OFF     (optoTrailGuard before the shutter moves)
-//   t = 66.7 ms  frame edge -- shutter REOPENS
-// The shutter therefore brackets the light at both ends and the stimulation
-// never runs while the shutter is open. Rest phases leave the shutter open.
+// Event timeline (30 Hz imaging, frame = 33.333 ms, blade = 5 ms both ways):
+//   t =  0.00 ms  frame edge -- shutter CLOSE commanded
+//   t =  5.00 ms  blade fully closed
+//   t =  6.00 ms  opto ON        (optoLagTime; 1.0 ms margin past full closure)
+//   t = 26.00 ms  opto OFF       (optoPulseDuration = 20 ms)
+//   t = 28.00 ms  shutter OPEN commanded (shutterOpenDelay = 2 ms after light off)
+//   t = 33.00 ms  blade fully open
+//   t = 33.33 ms  next frame edge -- imaging frame starts on a still, open blade
 //
-// Note the light stays on across the frame boundary inside a multi-frame phase,
-// so intra-phase flyback periods are illuminated. That is safe here precisely
-// because the shutter is closed for the whole phase -- but it does mean those
-// frames are not usable imaging frames.
+// The light never overlaps either blade transition, and the sequence has 0.33 ms
+// of slack against the frame boundary. That slack is thin: dropping
+// optoPulseDuration to 19 ms would restore it to 1.33 ms if the blade turns out
+// to be slower than spec under sustained cycling. The static_assert block below
+// will refuse to compile if any edit breaks the budget.
+//
+// The stim frame itself is a PARTIAL frame, not a dark one: the shutter reopens
+// at t = 28 ms, so the last ~5 ms of that frame images normally (bottom ~16% of
+// the raster has signal, the rest is black). Opto is already off by then, so
+// there is no exposure risk -- but don't let downstream frame classification be
+// confused by a partially-bright frame.
 
 const uint8_t framePin = 5;      // ScanImage frame/flyback signal input
 const uint8_t optoPin = 13;      // Optogenetics LED/laser control
@@ -28,18 +38,20 @@ const uint8_t PMTShutterPin = 7; // BNC out to shutter driver (NORMALLY OPEN:
                                  // via bench test, carried over from VR_Opto_7)
 
 // ---------------------------------------------------------------------------
-// THE ONE KNOB. Frames per phase, at a 30 Hz imaging clock:
+// REPETITION KNOB. framesPerAnchor sets how often a stim event fires; it no
+// longer affects the pulse shape, which is fixed by the deadlines below.
+// A stim event occupies one frame, so at a 30 Hz imaging clock:
 //
-//   framesPerAnchor   phase     shutter cycles/s   opto pulse   notes
-//         1           33.3 ms        15.0          30.6 ms      max shutter rate
-//         2           66.7 ms         7.5          64.0 ms      <-- current
-//         4          133.3 ms         3.75        130.6 ms      gentler still
+//   framesPerAnchor   stim every   stim rate   shutter cycles/s   light duty
+//         1            2 frames      15.0 Hz        15.0            30.0%
+//         2            4 frames       7.5 Hz         7.5            15.0%
+//         4            8 frames       3.75 Hz        3.75             7.5%
 //
 // Shutter is rated for its top rate in ~4 s bursts with ~1 min dead time, so
-// framesPerAnchor = 1 is a short-burst-only configuration. This is currently set
-// to the slower 2-frame version for testing; set it back to 1 to return to the
-// max-rate implementation -- nothing else needs to change.
-const uint8_t framesPerAnchor = 2;
+// framesPerAnchor = 1 is a short-burst-only configuration. Note that reducing
+// the pulse length does NOT reduce shutter wear -- only framesPerAnchor does,
+// since the blade still does one full close/open cycle per stim event.
+const uint8_t framesPerAnchor = 1;
 // ---------------------------------------------------------------------------
 
 uint16_t highCount = 0;
@@ -48,22 +60,33 @@ bool fireThisAnchor = true; // alternates true/false at each anchor; true = fire
 bool prevFrameState = LOW;
 bool prevEnableState = LOW;
 
-bool optoActive = false;
-unsigned long optoStartTime = 0;
+bool optoActive = false;        // a stim event is in progress
+unsigned long optoStartTime = 0; // micros() at the triggering frame edge
 
 // Imaging frame period. Change if the microscope is not running at 30 Hz.
 const unsigned long framePeriod = 33333; // microseconds (30 Hz)
 
-// Guard bands that keep the light strictly inside the shutter-closed window:
-// optoLagTime after the shutter starts closing, optoTrailGuard before it
-// reopens. Both are generous relative to the shutter's own travel time.
-const unsigned long optoLagTime = 1000;    // microseconds
-const unsigned long optoTrailGuard = 1700; // microseconds
+// Measured full blade travel from command edge, open and close (bench-measured).
+// Only used by the compile-time budget checks; the firmware never waits on it.
+const unsigned long shutterTravel = 5000; // microseconds
 
-// Fill the phase, minus the guards at each end. Derived so that retiming via
-// framesPerAnchor cannot accidentally push light past the shutter.
-const unsigned long optoPulseDuration =
-    (unsigned long)framesPerAnchor * framePeriod - optoLagTime - optoTrailGuard;
+// The three deadlines that define a stim event, all relative to the frame edge.
+const unsigned long optoLagTime = 6000;        // shutter CLOSE -> opto ON
+const unsigned long optoPulseDuration = 20000; // opto ON duration
+const unsigned long shutterOpenDelay = 2000;   // opto OFF -> shutter OPEN
+
+// Derived absolute deadlines, measured from optoStartTime.
+const unsigned long optoOffTime = optoLagTime + optoPulseDuration;
+const unsigned long shutterOpenTime = optoOffTime + shutterOpenDelay;
+const unsigned long eventEndTime = shutterOpenTime + shutterTravel;
+
+// Budget guards -- these are the two invariants the whole design rests on.
+// If a future edit breaks either one, this fails to compile rather than
+// silently exposing the PMT.
+static_assert(optoLagTime >= shutterTravel,
+              "opto would fire before the blade is fully closed");
+static_assert(eventEndTime <= framePeriod,
+              "blade would still be moving when the next imaging frame starts");
 
 void setup() {
   pinMode(framePin, INPUT);
@@ -85,16 +108,15 @@ void loop() {
     fireThisAnchor = true;
   }
 
-  // Safety abort: if enable drops mid-pulse, force off and reopen immediately.
+  // Safety abort: if enable drops mid-event, kill the light and reopen.
   if (!currentEnableState && prevEnableState && optoActive) {
     digitalWrite(optoPin, LOW);
     digitalWrite(PMTShutterPin, LOW); // reopen
     optoActive = false;
   }
 
-  // Anchored on the first edge after enable, then every framesPerAnchor edges
-  // (with framesPerAnchor = 2: edges 1, 3, 5, ...). Every other anchor fires;
-  // the alternate ones end the phase.
+  // Anchored on the first edge after enable, then every framesPerAnchor edges.
+  // Every other anchor fires; the alternate ones are the rest interval.
   if (currentEnableState) {
     if (currentFrameState && !prevFrameState) { // rising edge on frame signal
       highCount++;
@@ -104,28 +126,29 @@ void loop() {
           optoStartTime = micros();
           optoActive = true;
         }
-        // This is what clears optoActive and reopens the shutter -- the timeout
-        // below only drives the opto pin LOW. Safe for any framesPerAnchor,
-        // since fireThisAnchor alternates between anchors, so a skipped anchor
-        // always follows a firing one.
-        if (!fireThisAnchor && optoActive) {
-          digitalWrite(PMTShutterPin, LOW); // reopen after the light is done
-          optoActive = false;
-        }
         fireThisAnchor = !fireThisAnchor; // alternate regardless of whether this one fired
       }
     }
   }
 
-  // Start opto with a lag and keep it on until duration reached
-  if (optoActive && (micros() - optoStartTime >= optoLagTime) && (micros() - (optoStartTime + optoLagTime) < optoPulseDuration)) {
-    digitalWrite(optoPin, HIGH);
-  }
+  // Run the event off absolute deadlines. Each event completes well before the
+  // next anchor, so optoActive is cleared here rather than by a later frame edge.
+  if (optoActive) {
+    unsigned long elapsed = micros() - optoStartTime;
 
-  // End the pulse once duration reached. The shutter stays closed until the next
-  // anchor (see the skipped-anchor branch above).
-  if (optoActive && (micros() - (optoStartTime + optoLagTime) >= optoPulseDuration)) {
-    digitalWrite(optoPin, LOW);
+    if (elapsed >= optoLagTime && elapsed < optoOffTime) {
+      digitalWrite(optoPin, HIGH);
+    }
+
+    if (elapsed >= optoOffTime) {
+      digitalWrite(optoPin, LOW);
+    }
+
+    // Reopen last, and only after the light has been off for shutterOpenDelay.
+    if (elapsed >= shutterOpenTime) {
+      digitalWrite(PMTShutterPin, LOW);
+      optoActive = false;
+    }
   }
 
   prevFrameState = currentFrameState;
